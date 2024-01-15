@@ -1,0 +1,342 @@
+---
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: buildah
+  labels:
+    app.kubernetes.io/version: 0.2.0
+  annotations:
+    tekton.dev/categories: containers
+    tekton.dev/pipelines.minVersion: 0.41.0
+    tekton.dev/tags: containers
+spec:
+  description: |
+    Buildah task builds source into a container image and
+    then pushes it to a container registry.
+
+  workspaces:
+    - name: source
+      optional: false
+      description: |
+        Container build context, like for instnace a application source code
+        followed by a `Dockerfile`.
+    - name: dockerconfig
+      description: >-
+        An optional workspace that allows providing a .docker/config.json file
+        for Buildah to access the container registry.
+        The file should be placed at the root of the Workspace with name config.json
+        or .dockerconfigjson.
+      optional: true
+
+  params:
+    - name: IMAGE
+      type: string
+      description: |
+        Fully qualified container image name to be built by buildah.
+    - name: DOCKERFILE
+      type: string
+      default: ./Dockerfile
+      description: |
+        Path to the `Dockerfile` (or `Containerfile`) relative to the `source` workspace.
+    - name: CONTEXT
+      type: string
+      default: "."
+      description: |
+        Path to the directory to use as context.
+    - name: STORAGE_DRIVER
+      type: string
+      default: vfs
+      description: |
+        Set buildah storage driver to reflect the currrent cluster node's
+        settings.
+    - name: FORMAT
+      description: The format of the built container, oci or docker
+      default: "oci"
+    - name: BUILD_EXTRA_ARGS
+      type: string
+      default: ""
+      description: |
+        Extra parameters passed for the build command when building images.
+    - name: PUSH_EXTRA_ARGS
+      type: string
+      default: ""
+      description: |
+        Extra parameters passed for the push command when pushing images.
+    - name: SKIP_PUSH
+      default: "false"
+      description: |
+        Skip pushing the image to the container registry.
+    - name: TLS_VERIFY
+      type: string
+      default: "true"
+      description: |
+        Sets the TLS verification flag, `true` is recommended.
+    - name: VERBOSE
+      type: string
+      default: "false"
+      description: |
+        Turns on verbose logging, all commands executed will be printed out.
+
+  results:
+    - name: IMAGE_URL
+      description: |
+        Fully qualified image name.
+    - name: IMAGE_DIGEST
+      description: |
+        Digest of the image just built.
+
+  stepTemplate:
+    env:
+      - name: PARAMS_IMAGE
+        value: "$(params.IMAGE)"
+      - name: PARAMS_CONTEXT
+        value: "$(params.CONTEXT)"
+      - name: PARAMS_DOCKERFILE
+        value: "$(params.DOCKERFILE)"
+      - name: PARAMS_FORMAT
+        value: "$(params.FORMAT)"
+      - name: PARAMS_STORAGE_DRIVER
+        value: "$(params.STORAGE_DRIVER)"
+      - name: PARAMS_BUILD_EXTRA_ARGS
+        value: "$(params.BUILD_EXTRA_ARGS)"
+      - name: PARAMS_PUSH_EXTRA_ARGS
+        value: "$(params.PUSH_EXTRA_ARGS)"
+      - name: PARAMS_SKIP_PUSH
+        value: "$(params.SKIP_PUSH)"
+      - name: PARAMS_TLS_VERIFY
+        value: "$(params.TLS_VERIFY)"
+      - name: PARAMS_VERBOSE
+        value: "$(params.VERBOSE)"
+      - name: WORKSPACES_SOURCE_BOUND
+        value: "$(workspaces.source.bound)"
+      - name: WORKSPACES_SOURCE_PATH
+        value: "$(workspaces.source.path)"
+      - name: WORKSPACES_DOCKERCONFIG_BOUND
+        value: "$(workspaces.dockerconfig.bound)"
+      - name: WORKSPACES_DOCKERCONFIG_PATH
+        value: "$(workspaces.dockerconfig.path)"
+      - name: RESULTS_IMAGE_URL_PATH
+        value: "$(results.IMAGE_URL.path)"
+      - name: RESULTS_IMAGE_DIGEST_PATH
+        value: "$(results.IMAGE_DIGEST.path)"
+
+  steps:
+    - name: load-scripts
+      image: registry.access.redhat.com/ubi8-minimal:8.9
+      workingDir: /scripts
+      script: |
+        #
+        # https://github.com/openshift-pipelines/task-containers/blob/main/scripts/common.sh
+        #
+
+        # tekton's home directory
+        declare -rx TEKTON_HOME="${TEKTON_HOME:-/tekton/home}"
+
+        #
+        # Functions
+        #
+
+        function fail() {
+            echo "ERROR: ${*}" 2>&1
+            exit 1
+        }
+
+        function phase() {
+            echo "---> Phase: ${*}..."
+        }
+
+        # assert local variables are exporeted on the environment
+        function exported_or_fail() {
+            declare -a _required_vars="${@}"
+
+            for v in ${_required_vars[@]}; do
+                [[ -z "${!v}" ]] &&
+                    fail "'${v}' environment variable is not set!"
+            done
+
+            return 0
+        }
+
+        #
+        # https://github.com/openshift-pipelines/task-containers/blob/main/scripts/buildah-common.sh
+        #
+
+        declare -rx PARAMS_IMAGE="${PARAMS_IMAGE:-}"
+        declare -rx PARAMS_DOCKERFILE="${PARAMS_DOCKERFILE:-}"
+        declare -rx PARAMS_CONTEXT="${PARAMS_CONTEXT:-}"
+        declare -rx PARAMS_STORAGE_DRIVER="${PARAMS_STORAGE_DRIVER:-}"
+        declare -rx PARAMS_BUILD_EXTRA_ARGS="${PARAMS_BUILD_EXTRA_ARGS:-}"
+        declare -rx PARAMS_PUSH_EXTRA_ARGS="${PARAMS_PUSH_EXTRA_ARGS:-}"
+        declare -rx PARAMS_SKIP_PUSH="${PARAMS_SKIP_PUSH:-}"
+        declare -rx PARAMS_TLS_VERIFY="${PARAMS_TLS_VERIFY:-}"
+        declare -rx PARAMS_VERBOSE="${PARAMS_VERBOSE:-}"
+
+        declare -rx WORKSPACES_SOURCE_PATH="${WORKSPACES_SOURCE_PATH:-}"
+        declare -rx WORKSPACES_SOURCE_BOUND="${WORKSPACES_SOURCE_BOUND:-}"
+        declare -rx WORKSPACES_DOCKERCONFIG_PATH="${WORKSPACES_DOCKERCONFIG_PATH:-}"
+        declare -rx WORKSPACES_DOCKERCONFIG_BOUND="${WORKSPACES_DOCKERCONFIG_BOUND:-}"
+
+        declare -rx RESULTS_IMAGE_DIGEST_PATH="${RESULTS_IMAGE_DIGEST_PATH:-}"
+        declare -rx RESULTS_IMAGE_URL_PATH="${RESULTS_IMAGE_URL_PATH:-}"
+
+        #
+        # Dockerfile
+        #
+
+        # exposing the full path to the container file, which by default should be relative to the primary
+        # workspace, to receive a different container-file location
+        declare -r dockerfile_on_ws="${WORKSPACES_SOURCE_PATH}/${PARAMS_DOCKERFILE}"
+        declare -x DOCKERFILE_FULL="${DOCKERFILE_FULL:-${dockerfile_on_ws}}"
+
+        #
+        # Asserting Environment
+        #
+
+        [[ -z "${DOCKERFILE_FULL}" ]] &&
+            fail "unable to find the Dockerfile, DOCKERFILE may have an incorrect location"
+
+        exported_or_fail \
+            WORKSPACES_SOURCE_PATH \
+            PARAMS_IMAGE
+
+        #
+        # Verbose Output
+        #
+
+        if [[ "${PARAMS_VERBOSE}" == "true" ]]; then
+            set -x
+        fi
+
+        #
+        # https://github.com/openshift-pipelines/task-containers/blob/main/scripts/buildah-bud.sh
+        #
+
+        #
+        # Wrapper around "buildah bud" to build and push a container image based on a Dockerfile.
+        #
+
+        shopt -s inherit_errexit
+        set -eu -o pipefail
+
+        source "$(dirname ${BASH_SOURCE[0]})/common.sh"
+        source "$(dirname ${BASH_SOURCE[0]})/buildah-common.sh"
+
+        function _buildah() {
+            buildah \
+                --storage-driver="${PARAMS_STORAGE_DRIVER}" \
+                --tls-verify="${PARAMS_TLS_VERIFY}" \
+                ${*}
+        }
+
+        #
+        # Prepare
+        #
+
+        # making sure the required workspace "source" is bounded, which means its volume is currently mounted
+        # and ready to use
+        phase "Inspecting source workspace '${WORKSPACES_SOURCE_PATH}' (PWD='${PWD}')"
+        [[ "${WORKSPACES_SOURCE_BOUND}" != "true" ]] &&
+            fail "Workspace 'source' is not bounded"
+
+        phase "Asserting the dockerfile/containerfile '${DOCKERFILE_FULL}' exists"
+        [[ ! -f "${DOCKERFILE_FULL}" ]] &&
+            fail "Dockerfile not found at: '${DOCKERFILE_FULL}'"
+
+        phase "Inspecting context '${PARAMS_CONTEXT}'"
+        [[ ! -d "${PARAMS_CONTEXT}" ]] &&
+            fail "CONTEXT param is not found at '${PARAMS_CONTEXT}', on source workspace"
+
+        # Handle optional dockerconfig secret
+        if [[ "${WORKSPACES_DOCKERCONFIG_BOUND}" == "true" ]]; then
+
+            # if config.json exists at workspace root, we use that
+            if test -f "${WORKSPACES_DOCKERCONFIG_PATH}/config.json"; then
+                export DOCKER_CONFIG="${WORKSPACES_DOCKERCONFIG_PATH}"
+
+                # else we look for .dockerconfigjson at the root
+            elif test -f "${WORKSPACES_DOCKERCONFIG_PATH}/.dockerconfigjson"; then
+                cp "${WORKSPACES_DOCKERCONFIG_PATH}/.dockerconfigjson" "$HOME/.docker/config.json"
+                export DOCKER_CONFIG="$HOME/.docker"
+
+                # need to error out if neither files are present
+            else
+                echo "neither 'config.json' nor '.dockerconfigjson' found at workspace root"
+                exit 1
+            fi
+        fi
+
+        #
+        # Build
+        #
+
+        phase "Building '${PARAMS_IMAGE}' based on '${DOCKERFILE_FULL}'"
+
+        [[ -n "${PARAMS_BUILD_EXTRA_ARGS}" ]] &&
+            phase "Extra 'buildah bud' arguments informed: '${PARAMS_BUILD_EXTRA_ARGS}'"
+
+        _buildah bud ${PARAMS_BUILD_EXTRA_ARGS} \
+            --no-cache \
+            --file="${DOCKERFILE_FULL}" \
+            --tag="${PARAMS_IMAGE}" \
+            ${PARAMS_CONTEXT}
+
+        if [[ "${PARAMS_SKIP_PUSH}" == "true" ]]; then
+            phase "Skipping pushing '${PARAMS_IMAGE}' to the container registry!"
+            exit 0
+        fi
+
+        #
+        # Push
+        #
+
+        phase "Pushing '${PARAMS_IMAGE}' to the container registry"
+
+        [[ -n "${PARAMS_PUSH_EXTRA_ARGS}" ]] &&
+            phase "Extra 'buildah bud' arguments informed: '${PARAMS_PUSH_EXTRA_ARGS}'"
+
+        # temporary file to store the image digest, information only obtained after pushing the image to the
+        # container registry
+        declare -r digest_file="/tmp/buildah-digest.txt"
+
+        _buildah push ${PARAMS_PUSH_EXTRA_ARGS} \
+            --digestfile="${digest_file}" \
+            ${PARAMS_IMAGE} \
+            docker://${PARAMS_IMAGE}
+
+        #
+        # Results
+        #
+
+        phase "Inspecting digest report ('${digest_file}')"
+
+        [[ ! -r "${digest_file}" ]] &&
+            fail "Unable to find digest-file at '${digest_file}'"
+
+        declare -r digest_sum="$(cat ${digest_file})"
+
+        [[ -z "${digest_sum}" ]] &&
+            fail "Digest file '${digest_file}' is empty!"
+
+        phase "Successfuly built container image '${PARAMS_IMAGE}' ('${digest_sum}')"
+        echo -n "${PARAMS_IMAGE}" | tee ${RESULTS_IMAGE_URL_PATH}
+        echo -n "${digest_sum}" | tee ${RESULTS_IMAGE_DIGEST_PATH}
+
+      volumeMounts:
+        - name: scripts-dir
+          mountPath: /scripts
+
+    - name: build
+      image: registry.access.redhat.com/ubi8/buildah:8.9
+      workingDir: /workspace/source
+      command:
+        - /scripts/buildah-bud.sh
+      securityContext:
+        capabilities:
+          add: ["SETFCAP"]
+      volumeMounts:
+        - name: scripts-dir
+          mountPath: /scripts
+
+  volumes:
+    - name: scripts-dir
+      emptyDir: {}
