@@ -28,6 +28,12 @@ spec:
         or .dockerconfigjson.
       optional: true
 
+  volumes:
+  - emptyDir: {}
+    name: varlibcontainers
+  - emptyDir: {}
+    name: sboms
+
   params:
     - name: IMAGE
       type: string
@@ -128,6 +134,10 @@ spec:
       securityContext:
         capabilities:
           add: ["SETFCAP"]
+
+      volumeMounts:
+      - mountPath: /var/lib/containers
+        name: varlibcontainers
 
       script: |
         #
@@ -282,14 +292,119 @@ spec:
             --tag="${PARAMS_IMAGE}" \
             ${PARAMS_CONTEXT}
 
-        if [[ "${PARAMS_SKIP_PUSH}" == "true" ]]; then
-            phase "Skipping pushing '${PARAMS_IMAGE}' to the container registry!"
-            exit 0
-        fi
+    - name: sbom-syft-generate
+      image: quay.io/redhat-appstudio/syft:v0.98.0@sha256:4d3856e6a2622700b9a9d5d74d9aaf5d8a55671653f80bf6c636677658680ede
+
+      volumeMounts:
+        - mountPath: /var/lib/containers
+          name: varlibcontainers
+        - mountPath: /sboms
+          name: sboms
+
+      workingDir: /sboms
+
+      script: |
+        syft dir:$(workspaces.source.path)/source --output cyclonedx-json=sbom-source.json
+        syft ${PARAMS_IMAGE} --output cyclonedx-json=sbom-image.json
+
+    - name: merge-syft-sboms
+      image: registry.access.redhat.com/ubi9/python-39:1-158@sha256:967000729b17efdea309e297f4b1961c38b902a1ef18f6d886b8086c2a12f01f
+
+      volumeMounts:
+        - mountPath: /var/lib/containers
+          name: varlibcontainers
+        - mountPath: /sboms
+          name: sboms
+
+      workingDir: /sboms
+
+      script: |
+        #!/bin/python3
+        import json
+
+        # load SBOMs
+        with open("./sbom-image.json") as f:
+          image_sbom = json.load(f)
+
+        with open("./sbom-source.json") as f:
+          source_sbom = json.load(f)
+
+        # fetch unique components from available SBOMs
+        def get_identifier(component):
+          return component["name"] + '@' + component.get("version", "")
+
+        image_sbom_components = image_sbom.get("components", [])
+        existing_components = [get_identifier(component) for component in image_sbom_components]
+
+        source_sbom_components = source_sbom.get("components", [])
+        for component in source_sbom_components:
+          if get_identifier(component) not in existing_components:
+            image_sbom_components.append(component)
+            existing_components.append(get_identifier(component))
+
+        image_sbom_components.sort(key=lambda c: get_identifier(c))
+
+        # write the CycloneDX unified SBOM
+        with open("./sbom-cyclonedx.json", "w") as f:
+          json.dump(image_sbom, f, indent=4)
+
+    - name: push-sbom
+      image: quay.io/redhat-appstudio/cosign:v2.1.1@sha256:c883d6f8d39148f2cea71bff4622d196d89df3e510f36c140c097b932f0dd5d5
+
+      securityContext:
+        capabilities:
+          add: ["SETFCAP"]
+
+      volumeMounts:
+        - mountPath: /sboms
+          name: sboms
+
+      workingDir: /sboms
+
+      args:
+        - attach
+        - sbom
+        - --sbom
+        - sbom-cyclonedx.json
+        - --type
+        - cyclonedx
+        - $(params.IMAGE)
+
+    - name: push-image
+      image: registry.access.redhat.com/ubi8/buildah:8.9
+
+      securityContext:
+        capabilities:
+          add: ["SETFCAP"]
+
+      volumeMounts:
+        - mountPath: /var/lib/containers
+          name: varlibcontainers
+
+      script: |
+        #
+        # Redefining utility functions (should be improved later)
+        #
+
+        function phase() {
+          echo "---> Phase: ${*}..."
+        }
+
+        function _buildah() {
+          buildah \
+            --storage-driver="${PARAMS_STORAGE_DRIVER}" \
+            --tls-verify="${PARAMS_TLS_VERIFY}" \
+            ${*}
+        }
 
         #
         # Push
         #
+
+        if [[ "${PARAMS_SKIP_PUSH}" == "true" ]]; then
+          phase "Skipping pushing '${PARAMS_IMAGE}' to the container registry!"
+          exit 0
+        fi
 
         phase "Pushing '${PARAMS_IMAGE}' to the container registry"
 
