@@ -2,9 +2,9 @@
 apiVersion: tekton.dev/v1beta1
 kind: Task
 metadata:
-  name: buildah
+  name: buildah-rhtap
   labels:
-    app.kubernetes.io/version: 0.2.0
+    app.kubernetes.io/version: 0.1.0
   annotations:
     tekton.dev/categories: containers
     tekton.dev/pipelines.minVersion: 0.41.0
@@ -110,7 +110,7 @@ spec:
       - name: WORKSPACES_SOURCE_BOUND
         value: "$(workspaces.source.bound)"
       - name: WORKSPACES_SOURCE_PATH
-        value: "$(workspaces.source.path)"
+        value: "$(workspaces.source.path)/source"
       - name: WORKSPACES_DOCKERCONFIG_BOUND
         value: "$(workspaces.dockerconfig.bound)"
       - name: WORKSPACES_DOCKERCONFIG_PATH
@@ -121,9 +121,14 @@ spec:
         value: "$(results.IMAGE_DIGEST.path)"
 
   steps:
-    - name: load-scripts
-      image: registry.access.redhat.com/ubi8-minimal:8.9
-      workingDir: /scripts
+    - name: build
+      image: registry.access.redhat.com/ubi8/buildah:8.9
+      workingDir: "$(workspaces.source.path)/source"
+
+      securityContext:
+        capabilities:
+          add: ["SETFCAP"]
+
       script: |
         #
         # https://github.com/openshift-pipelines/task-containers/blob/main/scripts/common.sh
@@ -217,9 +222,6 @@ spec:
 
         shopt -s inherit_errexit
         set -eu -o pipefail
-
-        source "$(dirname ${BASH_SOURCE[0]})/common.sh"
-        source "$(dirname ${BASH_SOURCE[0]})/buildah-common.sh"
 
         function _buildah() {
             buildah \
@@ -320,23 +322,3 @@ spec:
         phase "Successfuly built container image '${PARAMS_IMAGE}' ('${digest_sum}')"
         echo -n "${PARAMS_IMAGE}" | tee ${RESULTS_IMAGE_URL_PATH}
         echo -n "${digest_sum}" | tee ${RESULTS_IMAGE_DIGEST_PATH}
-
-      volumeMounts:
-        - name: scripts-dir
-          mountPath: /scripts
-
-    - name: build
-      image: registry.access.redhat.com/ubi8/buildah:8.9
-      workingDir: /workspace/source
-      command:
-        - /scripts/buildah-bud.sh
-      securityContext:
-        capabilities:
-          add: ["SETFCAP"]
-      volumeMounts:
-        - name: scripts-dir
-          mountPath: /scripts
-
-  volumes:
-    - name: scripts-dir
-      emptyDir: {}
